@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/middleware"
 	"github.com/influxdata/influxdb/v2"
 	kithttp "github.com/influxdata/influxdb/v2/kit/transport/http"
 	"go.uber.org/zap"
@@ -31,6 +32,11 @@ func NewHTTPHandler(log *zap.Logger, dbrpSvc influxdb.DBRPMappingServiceV2) *Han
 	}
 
 	r := chi.NewRouter()
+	r.Use(
+		middleware.Recoverer,
+		middleware.RequestID,
+		middleware.RealIP,
+	)
 
 	r.Route("/", func(r chi.Router) {
 		r.Post("/", h.handlePostDBRP)

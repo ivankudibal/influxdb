@@ -64,7 +64,7 @@ func (c *Client) FindMany(ctx context.Context, filter influxdb.DBRPMappingFilter
 		params = append(params, [2]string{"db", *filter.Database})
 	}
 	if filter.RetentionPolicy != nil {
-		params = append(params, [2]string{"db", *filter.RetentionPolicy})
+		params = append(params, [2]string{"rp", *filter.RetentionPolicy})
 	}
 
 	var resp getDBRPsResponse
