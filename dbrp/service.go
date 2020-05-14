@@ -23,15 +23,12 @@ package dbrp
 //
 // On *delete*, the service updates the mapping.
 // If the deletion deletes the default mapping, the first mapping found is set as default.
-//
-// NOTE: every *find* operation does not update default values for mappings in the transaction for retrieving the mapping.
-// This should not cause any relevant inconsistency.
-// *Write* operations on `Default` are consistent with writes.
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/influxdata/influxdb/v2"
 	"github.com/influxdata/influxdb/v2/kv"
@@ -95,23 +92,22 @@ func NewService(ctx context.Context, bucketSvc influxdb.BucketService, st kv.Sto
 	}, nil
 }
 
-// getDefault returns the default mapping ID for the given orgID and db as bytes.
-func (s *Service) getDefault(ctx context.Context, orgID influxdb.ID, db string) ([]byte, error) {
-	var id []byte
-	err := s.store.View(ctx, func(tx kv.Tx) error {
-		defID, err := s.getDefaultTx(tx, composeForeignKey(orgID, db))
-		if err != nil {
-			return err
-		}
-		id = defID
-		return nil
-	})
-	return id, err
+// getDefault gets the default mapping ID inside of a transaction.
+func (s *Service) getDefault(tx kv.Tx, compKey []byte) ([]byte, error) {
+	b, err := tx.Bucket(defaultBucket)
+	if err != nil {
+		return nil, err
+	}
+	defID, err := b.Get(compKey)
+	if err != nil {
+		return nil, err
+	}
+	return defID, nil
 }
 
 // getDefaultID returns the default mapping ID for the given orgID and db.
-func (s *Service) getDefaultID(ctx context.Context, orgID influxdb.ID, db string) (influxdb.ID, error) {
-	defID, err := s.getDefault(ctx, orgID, db)
+func (s *Service) getDefaultID(tx kv.Tx, compKey []byte) (influxdb.ID, error) {
+	defID, err := s.getDefault(tx, compKey)
 	if err != nil {
 		return 0, err
 	}
@@ -123,28 +119,74 @@ func (s *Service) getDefaultID(ctx context.Context, orgID influxdb.ID, db string
 }
 
 // isDefault tells whether a mapping is the default one.
-func (s *Service) isDefault(ctx context.Context, m *influxdb.DBRPMappingV2) (bool, error) {
-	defID, err := s.getDefault(ctx, m.OrganizationID, m.Database)
+func (s *Service) isDefault(tx kv.Tx, compKey []byte, id []byte) (bool, error) {
+	defID, err := s.getDefault(tx, compKey)
+	if kv.IsNotFound(err) {
+		return false, nil
+	}
 	if err != nil {
-		if kv.IsNotFound(err) {
-			return false, nil
-		}
 		return false, err
 	}
-	dbrpID, _ := m.ID.Encode()
-	return bytes.Equal(dbrpID, defID), nil
+	return bytes.Equal(id, defID), nil
 }
 
-// updateDefault updates the default value of the given mapping based on the default value stored.
-func (s *Service) updateDefault(ctx context.Context, m *influxdb.DBRPMappingV2) error {
-	if d, err := s.isDefault(ctx, m); err != nil {
-		return err
-	} else if d {
-		m.Default = true
-	} else {
-		m.Default = false
+// isDefaultSet tells if there is a default mapping for the given composite key.
+func (s *Service) isDefaultSet(tx kv.Tx, compKey []byte) (bool, error) {
+	b, err := tx.Bucket(defaultBucket)
+	if err != nil {
+		return false, ErrInternalService(err)
+	}
+	_, err = b.Get(compKey)
+	if kv.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, ErrInternalService(err)
+	}
+	return true, nil
+}
+
+// setAsDefault sets the given id as default for the given composite key.
+func (s *Service) setAsDefault(tx kv.Tx, compKey []byte, id []byte) error {
+	b, err := tx.Bucket(defaultBucket)
+	if err != nil {
+		return ErrInternalService(err)
+	}
+	if err := b.Put(compKey, id); err != nil {
+		return ErrInternalService(err)
 	}
 	return nil
+}
+
+// unsetDefault un-sets the default for the given composite key.
+// Useful when a db/rp pair does not exist anymore.
+func (s *Service) unsetDefault(tx kv.Tx, compKey []byte) error {
+	b, err := tx.Bucket(defaultBucket)
+	if err != nil {
+		return ErrInternalService(err)
+	}
+	if err = b.Delete(compKey); err != nil {
+		return ErrInternalService(err)
+	}
+	return nil
+}
+
+// getFirstBut returns the first element in the db/rp index (not accounting for the `skipID`).
+// If the length of the returned ID is 0, it means no element was found.
+// The skip value is useful, for instance, if one wants to delete an element based on the result of this operation.
+func (s *Service) getFirstBut(tx kv.Tx, compKey []byte, skipID []byte) ([]byte, error) {
+	stop := fmt.Errorf("stop")
+	var next []byte
+	if err := s.byOrgAndDatabase.Walk(context.Background(), tx, compKey, func(k, v []byte) error {
+		if bytes.Equal(skipID, k) {
+			return nil
+		}
+		next = k
+		return stop
+	}); err != nil && err != stop {
+		return nil, ErrInternalService(err)
+	}
+	return next, nil
 }
 
 // isDBRPUnique verifies if the triple orgID-database-retention-policy is unique.
@@ -168,67 +210,6 @@ func (s *Service) isDBRPUnique(ctx context.Context, m influxdb.DBRPMappingV2) er
 	})
 }
 
-// getDefaultTx gets the default mapping ID inside of a transaction.
-func (s *Service) getDefaultTx(tx kv.Tx, compKey []byte) ([]byte, error) {
-	b, err := tx.Bucket(defaultBucket)
-	if err != nil {
-		return nil, err
-	}
-	defID, err := b.Get(compKey)
-	if err != nil {
-		return nil, err
-	}
-	return defID, nil
-}
-
-// setDefaultTx sets the given ID as default according to the given default value.
-// setDefaultTx ensures that the first value for the given composite key is always the default,
-// disrespectfully of the given default value.
-// NOTE: updates to the bucket happen in a transaction.
-func (s *Service) setDefaultTx(tx kv.Tx, compKey []byte, id []byte, defValue bool) (bool, error) {
-	set := defValue
-	b, err := tx.Bucket(defaultBucket)
-	if err != nil {
-		return defValue, ErrInternalService(err)
-	}
-	_, err = b.Get(compKey)
-	if err != nil {
-		if kv.IsNotFound(err) {
-			// This is the only one.
-			// This has to be default, no matter defValue.
-			set = true
-		} else {
-			return defValue, ErrInternalService(err)
-		}
-	}
-	if set {
-		if err := b.Put(compKey, id); err != nil {
-			return defValue, ErrInternalService(err)
-		}
-	}
-	return set, nil
-}
-
-// setFirstDefaultTx sets the first mapping for the given composite key as default.
-// NOTE: updates to the bucket happen in a transaction.
-func (s *Service) setFirstDefaultTx(tx kv.Tx, compKey []byte) error {
-	next, err := s.byOrgAndDatabase.First(tx, compKey)
-	if err != nil {
-		if kv.IsNotFound(err) {
-			// Nothing to do here, there is nothing to set as default.
-			return nil
-		}
-		return ErrInternalService(err)
-	}
-	var m influxdb.DBRPMappingV2
-	if err := json.Unmarshal(next, &m); err != nil {
-		return ErrInternalService(err)
-	}
-	nextID, _ := m.ID.Encode()
-	_, err = s.setDefaultTx(tx, compKey, nextID, true)
-	return err
-}
-
 // FindBy returns the mapping for the given ID.
 func (s *Service) FindByID(ctx context.Context, orgID, id influxdb.ID) (*influxdb.DBRPMappingV2, error) {
 	encodedID, err := id.Encode()
@@ -236,51 +217,49 @@ func (s *Service) FindByID(ctx context.Context, orgID, id influxdb.ID) (*influxd
 		return nil, ErrInvalidDBRPID
 	}
 
-	var b []byte
+	m := &influxdb.DBRPMappingV2{}
 	if err := s.store.View(ctx, func(tx kv.Tx) error {
 		bucket, err := tx.Bucket(bucket)
 		if err != nil {
 			return ErrInternalService(err)
 		}
-		b, err = bucket.Get(encodedID)
+		b, err := bucket.Get(encodedID)
 		if err != nil {
 			return ErrDBRPNotFound
+		}
+		if err := json.Unmarshal(b, m); err != nil {
+			return ErrInternalService(err)
+		}
+		// If the given orgID is wrong, it is as if we did not found a mapping scoped to this org.
+		if m.OrganizationID != orgID {
+			return ErrDBRPNotFound
+		}
+		// Update the default value for this mapping.
+		m.Default, err = s.isDefault(tx, indexForeignKey(*m), encodedID)
+		if err != nil {
+			return ErrInternalService(err)
 		}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-
-	dbrp := &influxdb.DBRPMappingV2{}
-	if err := json.Unmarshal(b, dbrp); err != nil {
-		return nil, ErrInternalService(err)
-	}
-	// If the given orgID is wrong, it is as if we did not found a mapping scoped to this org.
-	if dbrp.OrganizationID != orgID {
-		return nil, ErrDBRPNotFound
-	}
-	// Update the default value for this DBRP.
-	if err := s.updateDefault(ctx, dbrp); err != nil {
-		return nil, ErrInternalService(err)
-	}
-	return dbrp, nil
+	return m, nil
 }
 
 // FindMany returns a list of mappings that match filter and the total count of matching dbrp mappings.
 // TODO(affo): find a smart way to apply FindOptions to a list of items.
 func (s *Service) FindMany(ctx context.Context, filter influxdb.DBRPMappingFilterV2, opts ...influxdb.FindOptions) ([]*influxdb.DBRPMappingV2, int, error) {
-	// Memoize defaults.
+	// Memoize default IDs.
 	defs := make(map[string]*influxdb.ID)
-	get := func(orgID influxdb.ID, db string) (*influxdb.ID, error) {
+	get := func(tx kv.Tx, orgID influxdb.ID, db string) (*influxdb.ID, error) {
 		k := orgID.String() + db
 		if _, ok := defs[k]; !ok {
-			id, err := s.getDefaultID(ctx, orgID, db)
-			if err != nil {
-				if kv.IsNotFound(err) {
-					defs[k] = nil
-				} else {
-					return nil, err
-				}
+			id, err := s.getDefaultID(tx, composeForeignKey(orgID, db))
+			if kv.IsNotFound(err) {
+				// Still need to store a not-found result.
+				defs[k] = nil
+			} else if err != nil {
+				return nil, err
 			} else {
 				defs[k] = &id
 			}
@@ -290,32 +269,29 @@ func (s *Service) FindMany(ctx context.Context, filter influxdb.DBRPMappingFilte
 
 	var err error
 	ms := []*influxdb.DBRPMappingV2{}
-
-	addDBRP := func(_, v []byte) error {
-		m := &influxdb.DBRPMappingV2{}
-		if err := json.Unmarshal(v, m); err != nil {
-			return ErrInternalService(err)
+	add := func(tx kv.Tx) func(k, v []byte) error {
+		return func(k, v []byte) error {
+			m := influxdb.DBRPMappingV2{}
+			if err := json.Unmarshal(v, &m); err != nil {
+				return ErrInternalService(err)
+			}
+			// Updating the Default field must be done before filtering.
+			defID, err := get(tx, m.OrganizationID, m.Database)
+			if err != nil {
+				return ErrInternalService(err)
+			}
+			m.Default = m.ID == *defID
+			if filterFunc(&m, filter) {
+				ms = append(ms, &m)
+			}
+			return nil
 		}
-		// Updating the Default field must be done before filtering.
-		defID, err := get(m.OrganizationID, m.Database)
-		if err != nil {
-			return ErrInternalService(err)
-		}
-		if m.ID == *defID {
-			m.Default = true
-		} else {
-			m.Default = false
-		}
-		if filterFunc(m, filter) {
-			ms = append(ms, m)
-		}
-		return nil
 	}
 
 	// Optimized path VS non-optimized one.
 	if orgID, db := filter.OrgID, filter.Database; orgID != nil && db != nil {
 		err = s.store.View(ctx, func(tx kv.Tx) error {
-			return s.byOrgAndDatabase.Walk(ctx, tx, composeForeignKey(*orgID, *db), addDBRP)
+			return s.byOrgAndDatabase.Walk(ctx, tx, composeForeignKey(*orgID, *db), add(tx))
 		})
 	} else {
 		err = s.store.View(ctx, func(tx kv.Tx) error {
@@ -329,7 +305,7 @@ func (s *Service) FindMany(ctx context.Context, filter influxdb.DBRPMappingFilte
 			}
 
 			for k, v := cur.First(); k != nil; k, v = cur.Next() {
-				if err := addDBRP(k, v); err != nil {
+				if err := add(tx)(k, v); err != nil {
 					return err
 				}
 			}
@@ -379,17 +355,24 @@ func (s *Service) Create(ctx context.Context, dbrp *influxdb.DBRPMappingV2) erro
 			return ErrInternalService(err)
 		}
 		if err := bucket.Put(encodedID, b); err != nil {
-			return err
+			return ErrInternalService(err)
 		}
 		compKey := indexForeignKey(*dbrp)
 		if err := s.byOrgAndDatabase.Insert(tx, compKey, encodedID); err != nil {
 			return err
 		}
-		newDef, err := s.setDefaultTx(tx, compKey, encodedID, dbrp.Default)
+		defSet, err := s.isDefaultSet(tx, compKey)
 		if err != nil {
-			return ErrInternalService(err)
+			return err
 		}
-		dbrp.Default = newDef
+		if !defSet {
+			dbrp.Default = true
+		}
+		if dbrp.Default {
+			if err := s.setAsDefault(tx, compKey, encodedID); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
@@ -435,11 +418,18 @@ func (s *Service) Update(ctx context.Context, dbrp *influxdb.DBRPMappingV2) erro
 		}
 		compKey := indexForeignKey(*dbrp)
 		if dbrp.Default {
-			_, err = s.setDefaultTx(tx, compKey, encodedID, dbrp.Default)
+			err = s.setAsDefault(tx, compKey, encodedID)
 		} else if oldDBRP.Default {
 			// This means default was unset.
 			// Need to find a new default.
-			err = s.setFirstDefaultTx(tx, compKey)
+			first, ferr := s.getFirstBut(tx, compKey, encodedID)
+			if ferr != nil {
+				return ferr
+			}
+			if len(first) > 0 {
+				err = s.setAsDefault(tx, compKey, first)
+			}
+			// If no first was found, then this will remain the default.
 		}
 		return err
 	})
@@ -470,10 +460,21 @@ func (s *Service) Delete(ctx context.Context, orgID, id influxdb.ID) error {
 			return ErrInternalService(err)
 		}
 		// If this was the default, we need to set a new default.
+		var derr error
 		if dbrp.Default {
-			return s.setFirstDefaultTx(tx, compKey)
+			first, err := s.getFirstBut(tx, compKey, encodedID)
+			if err != nil {
+				return err
+			}
+			if len(first) > 0 {
+				derr = s.setAsDefault(tx, compKey, first)
+			} else {
+				// This means no other mapping is in the index.
+				// Unset the default
+				derr = s.unsetDefault(tx, compKey)
+			}
 		}
-		return nil
+		return derr
 	})
 }
 

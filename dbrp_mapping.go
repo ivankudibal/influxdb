@@ -100,9 +100,8 @@ type DBRPMappingFilterV2 struct {
 
 func (f DBRPMappingFilterV2) String() string {
 	var s strings.Builder
-	s.WriteString("{")
 
-	s.WriteString(" id:")
+	s.WriteString("{ id:")
 	if f.ID != nil {
 		s.WriteString(f.ID.String())
 	} else {

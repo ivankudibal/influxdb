@@ -43,6 +43,48 @@ func (f DBRPMappingFieldsV2) Populate(ctx context.Context, s influxdb.DBRPMappin
 	return nil
 }
 
+// DBRPMappingServiceV2 tests all the service functions.
+func DBRPMappingServiceV2(
+	init func(DBRPMappingFieldsV2, *testing.T) (influxdb.DBRPMappingServiceV2, func()),
+	t *testing.T,
+) {
+	tests := []struct {
+		name string
+		fn   func(init func(DBRPMappingFieldsV2, *testing.T) (influxdb.DBRPMappingServiceV2, func()),
+			t *testing.T)
+	}{
+		{
+			name: "create",
+			fn:   CreateDBRPMappingV2,
+		},
+		{
+			name: "find by ID",
+			fn:   FindDBRPMappingByIDV2,
+		},
+		{
+			name: "find",
+			fn:   FindManyDBRPMappingsV2,
+		},
+		{
+			name: "update",
+			fn:   UpdateDBRPMappingV2,
+		},
+		{
+			name: "delete",
+			fn:   DeleteDBRPMappingV2,
+		},
+		{
+			name: "miscellaneous",
+			fn:   MiscDBRPMappingV2,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.fn(init, t)
+		})
+	}
+}
+
 // CleanupDBRPMappingsV2 finds and removes all dbrp mappings.
 func CleanupDBRPMappingsV2(ctx context.Context, s influxdb.DBRPMappingServiceV2) error {
 	mappings, _, err := s.FindMany(ctx, influxdb.DBRPMappingFilterV2{})
@@ -1533,4 +1575,96 @@ func DeleteDBRPMappingV2(
 			}
 		})
 	}
+}
+
+func MiscDBRPMappingV2(
+	init func(DBRPMappingFieldsV2, *testing.T) (influxdb.DBRPMappingServiceV2, func()),
+	t *testing.T,
+) {
+	fields := DBRPMappingFieldsV2{
+		DBRPMappingsV2: []*influxdb.DBRPMappingV2{
+			{
+				ID:              100,
+				Database:        "database1",
+				RetentionPolicy: "retention_policy1",
+				Default:         false,
+				OrganizationID:  MustIDBase16(dbrpOrg1ID),
+				BucketID:        MustIDBase16(dbrpBucket1ID),
+			},
+			{
+				ID:              200,
+				Database:        "database2",
+				RetentionPolicy: "retention_policy2",
+				Default:         true,
+				OrganizationID:  MustIDBase16(dbrpOrg2ID),
+				BucketID:        MustIDBase16(dbrpBucket2ID),
+			},
+		},
+	}
+	s, done := init(fields, t)
+	defer done()
+	ctx := context.Background()
+
+	t.Run("defaults are ok", func(t *testing.T) {
+		if !fields.DBRPMappingsV2[0].Default || !fields.DBRPMappingsV2[1].Default {
+			t.Errorf("should be default")
+		}
+	})
+
+	t.Run("what is inited is present", func(t *testing.T) {
+		filter := influxdb.DBRPMappingFilterV2{}
+		dbrpMappings, _, err := s.FindMany(ctx, filter)
+		if err != nil {
+			t.Fatalf("failed to retrieve dbrps: %v", err)
+		}
+		if diff := cmp.Diff(dbrpMappings, fields.DBRPMappingsV2, DBRPMappingCmpOptionsV2...); diff != "" {
+			t.Errorf("dbrpMappings are different -got/+want\ndiff %s", diff)
+		}
+	})
+
+	t.Run("delete works", func(t *testing.T) {
+		err := s.Delete(ctx, fields.DBRPMappingsV2[0].OrganizationID, fields.DBRPMappingsV2[0].ID)
+		if err != nil {
+			t.Fatalf("failed to delete: %v", err)
+		}
+		err = s.Delete(ctx, fields.DBRPMappingsV2[1].OrganizationID, fields.DBRPMappingsV2[1].ID)
+		if err != nil {
+			t.Fatalf("failed to delete: %v", err)
+		}
+	})
+
+	t.Run("nothing left", func(t *testing.T) {
+		filter := influxdb.DBRPMappingFilterV2{}
+		dbrpMappings, _, err := s.FindMany(ctx, filter)
+		if err != nil {
+			t.Fatalf("failed to retrieve dbrps: %v", err)
+		}
+		if diff := cmp.Diff(dbrpMappings, []*influxdb.DBRPMappingV2{}, DBRPMappingCmpOptionsV2...); diff != "" {
+			t.Errorf("dbrpMappings are different -got/+want\ndiff %s", diff)
+		}
+	})
+
+	t.Run("new one is still ok", func(t *testing.T) {
+		m := &influxdb.DBRPMappingV2{
+			ID:              300,
+			Database:        "database2",
+			RetentionPolicy: "retention_policy2",
+			Default:         false,
+			OrganizationID:  MustIDBase16(dbrpOrg2ID),
+			BucketID:        MustIDBase16(dbrpBucket2ID),
+		}
+		if err := s.Create(ctx, m); err != nil {
+			t.Fatalf("failed to create: %v", err)
+		}
+		got, err := s.FindByID(ctx, m.OrganizationID, m.ID)
+		if err != nil {
+			t.Fatalf("failed to retrieve dbrp: %v", err)
+		}
+		if diff := cmp.Diff(m, got, DBRPMappingCmpOptionsV2...); diff != "" {
+			t.Errorf("dbrpMappings are different -got/+want\ndiff %s", diff)
+		}
+		if !m.Default {
+			t.Errorf("should be default")
+		}
+	})
 }

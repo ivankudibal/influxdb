@@ -74,27 +74,7 @@ func initDBRPMappingService(f itesting.DBRPMappingFieldsV2, t *testing.T) (influ
 	}
 }
 
-func TestDBRPMappingService_CreateDBRPMapping(t *testing.T) {
+func TestBoltDBRPMappingServiceV2(t *testing.T) {
 	t.Parallel()
-	itesting.CreateDBRPMappingV2(initDBRPMappingService, t)
-}
-
-func TestDBRPMappingService_FindDBRPMappingByID(t *testing.T) {
-	t.Parallel()
-	itesting.FindDBRPMappingByIDV2(initDBRPMappingService, t)
-}
-
-func TestDBRPMappingService_FindDBRPMappings(t *testing.T) {
-	t.Parallel()
-	itesting.FindManyDBRPMappingsV2(initDBRPMappingService, t)
-}
-
-func TestDBRPMappingService_UpdateDBRPMapping(t *testing.T) {
-	t.Parallel()
-	itesting.UpdateDBRPMappingV2(initDBRPMappingService, t)
-}
-
-func TestDBRPMappingService_DeleteDBRPMapping(t *testing.T) {
-	t.Parallel()
-	itesting.DeleteDBRPMappingV2(initDBRPMappingService, t)
+	itesting.DBRPMappingServiceV2(initDBRPMappingService, t)
 }
